@@ -1,0 +1,128 @@
+#### File Structure ####
+# copied *.fastq.gz to FASTQ/ folder using cp command
+# So all raw data is there
+# coped all FASTA reference files (pUC18 and other genomes) to FASTA/ folder
+# mkdir TMP for temporary files
+# mkdir TRIM for output of filter_reads.sh
+
+#### Some work on reference genomes ####
+# Removed the phiX174 control track from the bacterial assembly
+head -2 assembly-unicycler_formatted.fasta > coli-only.fasta
+# The concatenated this with the Wichman ancestor (phix_AF176034.fasta) instead to make the "reference" genome
+cat coli-only.fasta phix_AF176034.fasta > reference.fasta
+# Used the pUC18 genome as is (called pUC18_L09136.fasta on my system)
+
+## also need to make some shuffled references - see note below
+
+# Index the references using BWA and put them in FASTA directory
+bwa index pUC18_L09136.fasta
+bwa index reference.fasta
+
+#### Variables (file references) to be defined in loop ####
+reads1=(FASTQ/*R1*.fastq.gz) # collect each forward read in iterator e.g. "FASTQ/A_S1_L001_R1_001.fastq.gz"
+reads1=("${reads1[@]##*/}") # stripping path e.g. "A_S1_L001_R1_001.fastq.gz"
+reads2=("${reads1[@]/_R1/_R2}") # substitute R2 for R1 e.g. "A_S1_L001_R2_001.fastq.gz"
+
+for ((i=0; i<=${#reads1[@]}-1; i++ )); do
+    fwdrds="${reads1[$i]}" # e.g. "A_S1_L001_R1_001.fastq.gz"
+    rvsrds="${reads2[$i]}" # e.g. "A_S1_L001_R2_001.fastq.gz"
+    id="${fwdrds%%_*}" # greedy strip _ from right e.g. "A"
+done
+
+
+##### NOW AUTOMATED ######
+#### Quality Trimming #### (reason for discarding adapter-trimmed reads is that they may overlap - we could feed those to PEAR but there aren't many)
+# Use cutadapt to process the PE reads simultaneously (checks for errors), first filter against Q10, discard adapter-trimmed reads
+cutadapt -q 10,10 -g GGGCTCGG -a GACGCTGC -G GCAGCGTC -A CCGAGCCC --discard-trimmed \
+-o ${id}_filtered_R1.fastq.gz -p ${id}_filtered_R2.fastq.gz FASTQ/${fwdrds} FASTQ/${rvsrds}
+
+# Use sickle to adaptively trim the remaining reads to Q30, discard reads <20 bases, write singletons to another file
+sickle pe -t sanger -l 20 -n -g -f ${id}_filtered_R1.fastq.gz -r ${id}_filtered_R2.fastq.gz \
+-o ${id}_trimmed_R1.fastq.gz -p ${id}_trimmed_R2.fastq.gz -s ${id}_singles.fastq.gz
+rm ${id}_filtered_R*.fastq.gz # cleanup
+
+## A note - we should "shuffle" some of the steps below - meaning repeat with a {1344-2686,1-1343} pUC18 genome and a {694-5386,1-2693} phiX genome
+## We can use this after we've completed all analysis steps to correct defects around the edge of the genome (by splicing in edges from the shuffled data).
+## An exception is the GREEDY mapping of the spike-in below where we will use a redundant genome {1-2686,1-250} to soak up all the spike-mapping reads...
+
+
+##### NOT YET AUTOMATED ######
+#### Mapping NEATLY against the spike-in (pUC18) #### CAN BE SHUFFLED
+# Mapping (-R = adding read group ID/sample to header, which we can use to improve calling across samples later)
+bwa mem -t 4 -R '@RG\tID:Oye\tSM:'"$id" FASTA/pUC18_L09136.fasta ${id}_singles.fastq.gz > ${id}_spikemapped_SE.sam
+bwa mem -t 4 -R '@RG\tID:Oye\tSM:'"$id" FASTA/pUC18_L09136.fasta ${id}_trimmed_R1.fastq.gz ${id}_trimmed_R2.fastq.gz > ${id}_spikemapped_PE.sam
+
+# Flagstat check
+samtools flagstat ${id}_spikemapped_SE.sam
+samtools flagstat ${id}_spikemapped_PE.sam
+
+## We can do other stuff with the spikemapped reads here... similar to treatment below for final mapped data
+
+
+##### NOW AUTOMATED ######
+#### Subtractive GREEDY mapping against the spike-in (pUC18) #### DO NOT SHUFFLE - still need to make {1-2686,1-250} genome
+# Mapping SE reads (no need for read groups - we will get back to FASTQ)
+bwa mem -t 4 FASTA/pUC18_L09136.fasta ${id}_singles.fastq.gz > ${id}_greedymapped_SE.sam
+
+# Select UNMAPPED reads (f=flag present, 4=unmapped) and cleanup
+samtools view -b -f 4 -o ${id}_unmapped_SE.bam ${id}_greedymapped_SE.sam
+rm ${id}_greedymapped_SE.sam # remove SAM
+
+# Mapping all PE reads in single-end mode (because we want to map liberally, I am wary about concatenation of gzipped files)
+cat ${id}_trimmed_R1.fastq.gz ${id}_trimmed_R2.fastq.gz > ${id}_all_PE.fastq.gz
+bwa mem -t 4 FASTA/pUC18_L09136.fasta ${id}_all_PE.fastq.gz > ${id}_greedymapped_PE.sam
+rm ${id}_all_PE.fastq.gz # cleanup concatenated FASTQ
+
+# Select UNMAPPED reads here too, then sort by read name (-n, because we need to emit paired end files next) and cleanup
+# Explanation: | is pipe and - is reference to intermediate output)
+samtools view -O SAM -h -f 4 ${id}_greedymapped_PE.sam | samtools sort -O BAM -n -o ${id}_unmapped_PE.bam -
+rm ${id}_greedymapped_PE.sam # remove SAM
+
+# Convert SE and PE BAM files to FASTQ (for PE singletons will be discarded by bedtools, which is conservative), cleanup
+bedtools bamtofastq -i ${id}_unmapped_SE.bam -fq ${id}_unmapped_SE.fastq
+bedtools bamtofastq -i ${id}_unmapped_PE.bam -fq ${id}_unmapped_R1.fastq -fq2 ${id}_unmapped_R2.fastq
+rm ${id}_unmapped_*.bam
+
+## We want these unmapped FASTQ to persist, we can use them again as inputs to the shuffled phiX mapping.
+
+
+#### Mapping (unmapped) reads against (concatenated) host and phix genomes (=reference) #### CAN BE SHUFFLED
+# Mapping (-R = adding read group ID/sample to header)
+bwa mem -t 4 -R '@RG\tID:Oye\tSM:'"$id" FASTA/reference.fasta ${id}_unmapped_SE.fastq > ${id}_refmapped_SE.sam
+bwa mem -t 4 -R '@RG\tID:Oye\tSM:'"$id" FASTA/reference.fasta ${id}_unmapped_R1.fastq ${id}_unmapped_R2.fastq > ${id}_refmapped_PE.sam
+
+# Convert SAMs to BAMs and cleanup
+samtools view -bS ${id}_refmapped_SE.sam > ${id}_refmapped_SE.bam
+samtools view -bS ${id}_refmapped_PE.sam > ${id}_refmapped_PE.bam
+rm ${id}_refmapped_*.sam # remove SAMs
+
+# Concatenate SE and PE BAMs and then pipe to sort by ref position (=default, don't use -n option)
+samtools cat ${id}_refmapped_SE.bam ${id}_refmapped_PE.bam | samtools sort -@ 3 -o ${id}_refmapped_merged.bam -
+rm ${id}_refmapped_SE.bam ${id}_refmapped_PE.bam # remove unmerged BAMs
+
+# Index
+samtools index ${id}_refmapped_merged.bam
+
+# Select only those reads mapping to phix and index again
+samtools view -b ${id}_refmapped_merged.bam AF176034.1 -o ${id}_phixmapped.bam
+samtools index ${id}_phixmapped.bam
+
+## these indexed BAMs can be viewed in IGV if you load corresponding FASTAs as genomes - we have awesome results!!
+
+# I think this is the best naive filter, options make it frequency-based and we can set -F based on validation procedure with spike-ins (currently 1%)
+freebayes -f FASTA/reference.fasta -F 0.01 -C 1 --pooled-continuous ${id}_phixmapped.bam > ${id}_phix_filtered.vcf
+
+## We can probably run FreeBayes over the whole set - it makes use of the read group info.
+
+#### DEPRECATED (not doing these anymore) ####
+# indel sorting (I think Freebayes is doing this internally)...
+# java -jar picard/picard.jar CreateSequenceDictionary R=AF176034.fasta O=AF176034.dict
+# java -jar GenomeAnalysisTK/GenomeAnalysisTK.jar -R AF176034.fasta -T LeftAlignIndels -I sorted3.bam -o AncestralLAI.bam
+
+# Make VCF file (set maximum depth to extreme value as we have high coverage)
+# samtools mpileup -uf FASTA/phix_AF176034.fasta -d 100000000 -v -t DP,AD,ADF,ADR ${id}_phixmapped.bam -o ${id}_phix_all.vcf
+# bcftools call --ploidy 1 --multiallelic-caller --keep-alts --variants-only --skip-variants indels -o ${id}_phix_filtered.vcf ${id}_phix_all.vcf
+
+# Check out the number of reads (the grep -v expression excludes lines beginning with @)
+# grep -v ^@ A_pe_mapped.sam | wc -l
+# grep -v ^@ A_se_mapped.sam | wc -l
