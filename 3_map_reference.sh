@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+__author__ = "Oyeronke Ayansola"
+__version__ = "1.0"
+
 usage() {
   NAME=$(basename $0)
   cat <<EOF
